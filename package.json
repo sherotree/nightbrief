@@ -1,0 +1,25 @@
+{
+  "name": "nightbrief",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Overnight chat and email digest. Gemma runs locally in the browser via WebLLM.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/lib/*.test.ts"
+  },
+  "dependencies": {
+    "@mlc-ai/web-llm": "0.2.86",
+    "next": "^15.5.4",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "typescript": "^5.9.2"
+  }
+}
