@@ -9,17 +9,25 @@ import {
   GEMMA_MODELS,
   pickDefaultModel,
 } from "@/lib/models";
+import { DigestCancelled, runDigestPasses, type DigestTurn } from "@/lib/digest";
+import {
+  createEngineSession,
+  disposeEngine,
+  loadEngine,
+  type EngineLike,
+} from "@/lib/engineSession";
 import { parseBrief, type MorningBrief } from "@/lib/parseBrief";
-import { buildUserPrompt, SYSTEM_PROMPT } from "@/lib/prompt";
 import { SAMPLE_DUMP } from "@/lib/sampleDump";
-import { fitDump, MAX_DUMP_CHARS } from "@/lib/text";
+import { chunkDump, dumpCharBudget } from "@/lib/text";
 
 type Phase = "idle" | "loading" | "writing" | "done" | "error";
 
-type LocalEngine = {
-  unload: () => Promise<void>;
+type LocalEngine = EngineLike & {
+  reload: (
+    model: string,
+    chatOpts?: { context_window_size: number; sliding_window_size: number },
+  ) => Promise<void>;
   resetChat: () => Promise<void> | void;
-  interruptGenerate: () => void;
   chat: {
     completions: {
       create: (args: {
@@ -77,6 +85,43 @@ function percent(progress: number): number {
   return Math.round(Math.max(0, Math.min(100, value)));
 }
 
+async function readCompletion(
+  engine: LocalEngine,
+  turn: DigestTurn,
+  onDelta: ((text: string) => void) | null,
+  shouldStop: () => boolean,
+): Promise<string> {
+  if (shouldStop()) throw new DigestCancelled();
+  // Each pass starts from an empty chat so earlier sections do not pile into the window.
+  await engine.resetChat();
+  const result = await engine.chat.completions.create({
+    messages: [
+      { role: "system", content: turn.system },
+      { role: "user", content: turn.user },
+    ],
+    temperature: turn.kind === "brief" ? 0.2 : 0.1,
+    top_p: 0.9,
+    max_tokens: turn.kind === "brief" ? 220 : 160,
+    seed: 7,
+    stream: true,
+  });
+
+  let raw = "";
+  if (isAsyncIterable(result)) {
+    for await (const chunk of result) {
+      if (shouldStop()) throw new DigestCancelled();
+      const delta = chunk.choices?.[0]?.delta?.content ?? "";
+      if (!delta) continue;
+      raw += delta;
+      onDelta?.(raw);
+    }
+    return raw;
+  }
+  raw = (result as FinalReply).choices?.[0]?.message?.content ?? "";
+  onDelta?.(raw);
+  return raw;
+}
+
 async function readDumpFile(file: File): Promise<string> {
   const name = file.name.toLowerCase();
   const textLike =
@@ -109,7 +154,11 @@ export function DigestStudio() {
   const [dragging, setDragging] = useState(false);
   const [fileLabel, setFileLabel] = useState("");
 
-  const engineRef = useRef<LocalEngine | null>(null);
+  const sessionRef = useRef<ReturnType<typeof createEngineSession> | null>(null);
+  const session =
+    sessionRef.current ?? (sessionRef.current = createEngineSession());
+  // Own the session before effects so the first click cannot race a late mount.
+  session.mount();
   const loadedModel = useRef<string | null>(null);
   const running = useRef(false);
   const userPicked = useRef(false);
@@ -138,12 +187,12 @@ export function DigestStudio() {
   }, []);
 
   useEffect(() => {
+    session.mount();
     return () => {
-      engineRef.current?.interruptGenerate?.();
-      void engineRef.current?.unload();
-      engineRef.current = null;
+      loadedModel.current = null;
+      void disposeEngine(session.unmount());
     };
-  }, []);
+  }, [session]);
 
   const applyText = useCallback((value: string, label?: string) => {
     setText(value);
@@ -168,11 +217,9 @@ export function DigestStudio() {
   const ensureEngine = useCallback(async (id: string) => {
     const webllm = (await import("@mlc-ai/web-llm")) as {
       prebuiltAppConfig: { model_list: Array<{ model_id: string }> };
-      CreateMLCEngine: (
-        model: string,
-        config: { initProgressCallback: (report: ProgressReport) => void },
-        chatOpts?: { context_window_size: number; sliding_window_size: number },
-      ) => Promise<LocalEngine>;
+      MLCEngine: new (config?: {
+        initProgressCallback?: (report: ProgressReport) => void;
+      }) => LocalEngine;
     };
 
     const known = webllm.prebuiltAppConfig.model_list.some(
@@ -182,31 +229,34 @@ export function DigestStudio() {
       throw new Error(`This WebLLM build does not list ${id}.`);
     }
 
-    if (engineRef.current && loadedModel.current === id) {
-      return engineRef.current;
-    }
-
-    if (engineRef.current) {
-      setProgressText("Setting the previous model aside…");
-      await engineRef.current.unload();
-      engineRef.current = null;
-      loadedModel.current = null;
-    }
-
-    const engine = await webllm.CreateMLCEngine(
-      id,
-      {
-        initProgressCallback: (report) => {
-          setProgress(percent(report.progress));
-          setProgressText(report.text);
-        },
+    // `new MLCEngine()` exists before `reload()` finishes. CreateMLCEngine()
+    // only returns after that, so a navigate-away mid-load would miss it.
+    const engine = await loadEngine({
+      session,
+      modelId: id,
+      loadedModelId: loadedModel.current,
+      onReplacing: () => {
+        if (session.isMounted()) {
+          setProgressText("Setting the previous model aside…");
+        }
       },
-      chatOptionsFor(id),
-    );
-    engineRef.current = engine;
+      create: () =>
+        new webllm.MLCEngine({
+          initProgressCallback: (report) => {
+            if (!session.isMounted()) return;
+            setProgress(percent(report.progress));
+            setProgressText(report.text);
+          },
+        }),
+      load: (created, modelId) => {
+        const chatOpts = chatOptionsFor(modelId);
+        return created.reload(modelId, chatOpts);
+      },
+    });
+    if (!engine) return null;
     loadedModel.current = id;
     return engine;
-  }, []);
+  }, [session]);
 
   const onDigest = useCallback(async () => {
     if (running.current) return;
@@ -223,16 +273,18 @@ export function DigestStudio() {
       return;
     }
 
-    const fitted = fitDump(text);
-    if (!fitted.text) {
+    const context = findModel(modelId)?.context ?? 4096;
+    const maxChars = dumpCharBudget(context);
+    const sections = chunkDump(text, maxChars);
+    if (sections.length === 0) {
       setPhase("error");
       setError("Paste a dump, drop a .txt file, or load the Maple Court sample.");
       return;
     }
 
     setNotice(
-      fitted.trimmed
-        ? `Kept the latest ${MAX_DUMP_CHARS.toLocaleString()} characters so they fit the context window.`
+      sections.length > 1
+        ? `This night is longer than one context window, so Gemma will read all ${sections.length} sections.`
         : "",
     );
 
@@ -243,47 +295,57 @@ export function DigestStudio() {
 
     try {
       const engine = await ensureEngine(modelId);
-      setPhase("writing");
-      setProgressText("Reading the night…");
-      await engine.resetChat();
-
-      const result = await engine.chat.completions.create({
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: buildUserPrompt(fitted.text) },
-        ],
-        temperature: 0.2,
-        top_p: 0.9,
-        max_tokens: 220,
-        seed: 7,
-        stream: true,
-      });
-
-      let raw = "";
-      if (isAsyncIterable(result)) {
-        for await (const chunk of result) {
-          const delta = chunk.choices?.[0]?.delta?.content ?? "";
-          if (!delta) continue;
-          raw += delta;
-          setLive(raw);
+      if (!engine || !session.isMounted()) {
+        if (session.isMounted()) {
+          setPhase("idle");
+          setProgressText("");
         }
-      } else {
-        raw =
-          (result as FinalReply).choices?.[0]?.message?.content ?? "";
+        return;
       }
 
-      const parsed = parseBrief(raw);
+      const outcome = await runDigestPasses({
+        dump: text,
+        maxChars,
+        shouldStop: () => !session.isMounted(),
+        complete: async (turn) => {
+          if (!session.isMounted()) throw new DigestCancelled();
+          if (turn.kind === "brief") {
+            setPhase("writing");
+            setProgress(100);
+            setProgressText(
+              sections.length > 1 ? "Writing the two lines…" : "Reading the night…",
+            );
+          } else if (turn.kind === "slice") {
+            setPhase("writing");
+            setProgress(Math.round(((turn.index - 1) / turn.total) * 100));
+            setProgressText(`Reading section ${turn.index} of ${turn.total}…`);
+          } else {
+            setPhase("writing");
+            setProgressText(`Folding the notes (${turn.index} of ${turn.total})…`);
+          }
+          return readCompletion(
+            engine,
+            turn,
+            turn.kind === "brief" && session.isMounted() ? setLive : null,
+            () => !session.isMounted(),
+          );
+        },
+      });
+
+      if (!session.isMounted()) return;
+      const parsed = parseBrief(outcome.raw);
       setBrief(parsed);
       setLive("");
       setPhase("done");
       setProgressText("");
     } catch (cause) {
+      if (!session.isMounted() || cause instanceof DigestCancelled) return;
       setPhase("error");
       setError(explainFailure(cause));
     } finally {
       running.current = false;
     }
-  }, [ensureEngine, gpu, modelId, text]);
+  }, [ensureEngine, gpu, modelId, session, text]);
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
@@ -455,7 +517,7 @@ export function DigestStudio() {
             bullets={brief?.bullets}
             placeholder={!brief && !live}
             raw={brief?.raw}
-            progress={showProgress ? (phase === "writing" ? 100 : progress) : null}
+            progress={showProgress ? progress : null}
             progressLabel={showProgress ? progressText : undefined}
           />
           {brief ? (
